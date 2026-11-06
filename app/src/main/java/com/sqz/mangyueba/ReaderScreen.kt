@@ -10,8 +10,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -48,12 +49,15 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.zip.ZipFile
 import kotlin.math.abs
 import kotlin.math.max
+
+/** 缩放超过该比例才接管单指拖动；轻微误触的缩放不应让列表无法滚动。 */
+private const val ZoomLockThreshold = 1.05f
 
 @Composable
 fun ReaderScreen(
@@ -152,7 +156,7 @@ private fun ReaderPager(
     }
     var scale by remember(volumeUri) { mutableFloatStateOf(1f) }
     var offset by remember(volumeUri) { mutableStateOf(Offset.Zero) }
-    val zoomed = scale > 1.001f
+    val zoomed = scale > ZoomLockThreshold
 
     val currentProgress by rememberUpdatedState(onProgress)
     val currentBack by rememberUpdatedState(onBack)
@@ -167,7 +171,10 @@ private fun ReaderPager(
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex }
             .distinctUntilChanged()
-            .collect { index -> onProgress(volumeIndex, index) }
+            .collect { index ->
+                // 写 SharedPreferences 会解析/序列化整库 JSON，不能放在滚动期间的主线程上
+                withContext(Dispatchers.IO) { currentProgress(volumeIndex, index) }
+            }
     }
 
     var userScrolled by remember(volumeUri) { mutableStateOf(false) }
@@ -184,11 +191,12 @@ private fun ReaderPager(
             listState.firstVisibleItemIndex to (info.visibleItemsInfo.lastOrNull()?.index ?: 0)
         }
             .distinctUntilChanged()
-            .collect { (first, last) ->
-                val targets = listOf(first - 1, last + 1, last + 2, first - 2)
+            .collectLatest { (first, last) ->
+                // 只预载紧邻的下一页/上一页；滚动中大量并行解码会挤占主线程的 CPU 时间
+                val targets = listOf(first - 1, last + 1)
                     .filter { it in pages.indices }
                 if (targets.isNotEmpty()) {
-                    scope.launch {
+                    withContext(Dispatchers.IO) {
                         targets.forEach { session.decodeAsync(it) }
                     }
                 }
@@ -237,19 +245,38 @@ private fun ReaderPager(
                 )
             }
             .pointerInput(volumeUri) {
-                detectTransformGestures { _, pan, zoom, _ ->
-                    val newScale = (scale * zoom).coerceIn(1f, 4f)
-                    if (newScale <= 1.001f) {
-                        scale = 1f
-                        offset = Offset.Zero
-                    } else {
-                        scale = newScale
-                        val maxX = (newScale - 1f) * size.width / 2f
-                        val maxY = (newScale - 1f) * size.height / 2f
-                        offset = Offset(
-                            x = (offset.x + pan.x).coerceIn(-maxX, maxX),
-                            y = (offset.y + pan.y).coerceIn(-maxY, maxY)
-                        )
+                // 只有双指，或已经放大到一定比例时，才接管拖动/缩放。
+                // detectTransformGestures 在单指也会消费事件，会和 LazyColumn 的滚动抢手势，
+                // 斜向滑动时会出现"滑不动"；这里显式避免单指抢占。
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    var transformActive = false
+                    var pressed = true
+                    while (pressed) {
+                        val event = awaitPointerEvent()
+                        if (!transformActive) {
+                            transformActive =
+                                event.changes.count { it.pressed } >= 2 ||
+                                    scale > ZoomLockThreshold
+                        }
+                        if (transformActive) {
+                            val newScale = (scale * event.calculateZoom()).coerceIn(1f, 4f)
+                            val pan = event.calculatePan()
+                            if (newScale <= 1.001f) {
+                                scale = 1f
+                                offset = Offset.Zero
+                            } else {
+                                scale = newScale
+                                val maxX = (newScale - 1f) * size.width / 2f
+                                val maxY = (newScale - 1f) * size.height / 2f
+                                offset = Offset(
+                                    x = (offset.x + pan.x).coerceIn(-maxX, maxX),
+                                    y = (offset.y + pan.y).coerceIn(-maxY, maxY)
+                                )
+                            }
+                            event.changes.forEach { it.consume() }
+                        }
+                        pressed = event.changes.any { it.pressed }
                     }
                 }
             }
