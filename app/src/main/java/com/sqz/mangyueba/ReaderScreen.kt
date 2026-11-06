@@ -398,15 +398,19 @@ class VolumeSession(
         return job.await()
     }
 
-    private fun decode(index: Int): Bitmap? = synchronized(lock) {
-        val zipFile = zip ?: return null
-        val page = pages.getOrNull(index) ?: return null
-        val entry = zipFile.getEntry(page.entry) ?: return null
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = page.sampleSize
-            inPreferredConfig = Bitmap.Config.RGB_565
+    private fun decode(index: Int): Bitmap? {
+        // 只在锁内取出 zip 与页信息，避免解码期间持锁阻塞主线程（主线程调用 decodeAsync 时会等这把锁）
+        val (zipFile, page) = synchronized(lock) {
+            val z = zip ?: return null
+            val p = pages.getOrNull(index) ?: return null
+            z to p
         }
-        try {
+        return try {
+            val entry = zipFile.getEntry(page.entry) ?: return null
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = page.sampleSize
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
             zipFile.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
         } catch (_: Exception) {
             null
