@@ -90,6 +90,30 @@ class LibraryStore(context: Context) {
         save(books.toMutableList().also { it[index] = updated })
     }
 
+    /**
+     * 用重新扫描到的卷列表替换书的 uris；卷列表未变化时不写盘。
+     * 若当前阅读卷仍存在，按 uri 定位新下标并保留页码，避免中间插入新卷导致进度错位。
+     */
+    fun updateVolumes(id: String, uris: List<String>): LibraryBook? {
+        val books = load()
+        val index = books.indexOfFirst { it.id == id }
+        if (index < 0) return null
+        val old = books[index]
+        if (old.uris == uris) return old
+        val currentUri = old.uris.getOrNull(old.volumeIndex)
+        val updated = if (currentUri != null && uris.indexOf(currentUri) >= 0) {
+            old.copy(uris = uris, volumeIndex = uris.indexOf(currentUri))
+        } else {
+            old.copy(
+                uris = uris,
+                volumeIndex = old.volumeIndex.coerceIn(0, uris.lastIndex.coerceAtLeast(0)),
+                pageIndex = 0
+            )
+        }
+        save(books.toMutableList().also { it[index] = updated })
+        return updated
+    }
+
     fun lastReadBook(): LibraryBook? =
         load().maxByOrNull { it.lastReadAt }?.takeIf { it.lastReadAt > 0L }
 

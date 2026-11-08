@@ -1,5 +1,6 @@
 package com.sqz.mangyueba
 
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -7,6 +8,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -16,6 +18,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -41,6 +45,12 @@ class MainActivity : ComponentActivity() {
                 var activeBookId by rememberSaveable { mutableStateOf(store.lastReadBook()?.id) }
                 val activeBook = books.firstOrNull { it.id == activeBookId }
 
+                // 进入/打开漫画时重扫文件夹：只列目录条目，已有卷继续复用解析缓存
+                LaunchedEffect(activeBookId) {
+                    val book = activeBook ?: return@LaunchedEffect
+                    refreshVolumes(book)?.let { books = it }
+                }
+
                 if (activeBook != null) {
                     ReaderScreen(
                         book = activeBook,
@@ -62,7 +72,6 @@ class MainActivity : ComponentActivity() {
                         targetWidth = screenWidth,
                         onOpenBook = { book ->
                             store.updateProgress(book.id, book.volumeIndex, book.pageIndex)
-                            books = store.load()
                             activeBookId = book.id
                         },
                         onLibraryChanged = { updated -> books = updated }
@@ -70,6 +79,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /** 读出文件夹当前所有 epub 的 document uri，按自然序返回；读取失败或为空时返回 null，避免清空已有卷。 */
+    private fun scanVolumes(book: LibraryBook): List<String>? {
+        if (!book.id.startsWith("folder:")) return null
+        val treeUri = Uri.parse(book.id.removePrefix("folder:"))
+        val files = SafUtils.listEpubFiles(this, treeUri).map { it.toString() }
+        return files.ifEmpty { null }
+    }
+
+    /** 目录内容未变化时返回 null；有变化则写回书库并返回刷新后的书库。 */
+    private suspend fun refreshVolumes(book: LibraryBook): List<LibraryBook>? {
+        val scanned = withContext(Dispatchers.IO) { scanVolumes(book) } ?: return null
+        if (scanned == book.uris) return null
+        withContext(Dispatchers.IO) { store.updateVolumes(book.id, scanned) } ?: return null
+        return withContext(Dispatchers.IO) { store.load() }
     }
 }
 
