@@ -92,8 +92,12 @@ class MainActivity : ComponentActivity() {
     /** 目录内容未变化时返回 null；有变化则写回书库并返回刷新后的书库。 */
     private suspend fun refreshVolumes(book: LibraryBook): List<LibraryBook>? {
         val scanned = withContext(Dispatchers.IO) { scanVolumes(book) } ?: return null
-        if (scanned == book.uris) return null
-        withContext(Dispatchers.IO) { store.updateVolumes(book.id, scanned) } ?: return null
+        // 跳过用户已删除的 epub，避免重扫时把它们当成新增卷补回
+        val removed = withContext(Dispatchers.IO) { store.removedUris() }
+        val effective = if (removed.isEmpty()) scanned else scanned.filterNot { it in removed }
+        // 过滤后为空或与现有卷一致时不写回，避免误清空书库与删除记录
+        if (effective.isEmpty() || effective == book.uris) return null
+        withContext(Dispatchers.IO) { store.updateVolumes(book.id, effective) } ?: return null
         return withContext(Dispatchers.IO) { store.load() }
     }
 }

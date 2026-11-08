@@ -73,9 +73,54 @@ class LibraryStore(context: Context) {
 
     fun add(book: LibraryBook): Boolean {
         val books = load()
+        // 手动重新选入视为重新加入：先清掉这些文件的删除记录，避免重扫时继续被跳过
+        clearRemoved(book.uris)
         if (books.any { it.id == book.id }) return false
         save(books + book)
         return true
+    }
+
+    /**
+     * 仅从书库移除该条目，不删除磁盘上的 EPUB 原文件；以后若要物理删除文件，集中在这里扩展。
+     * 同时记录被移除的 document uri，重扫文件夹时跳过它们，避免被当成新增卷自动补回。
+     */
+    fun remove(id: String): Boolean {
+        val books = load()
+        val index = books.indexOfFirst { it.id == id }
+        if (index < 0) return false
+        val removed = books[index]
+        save(books.toMutableList().also { it.removeAt(index) })
+        markRemoved(removed.uris)
+        return true
+    }
+
+    /** 已被用户删除的 epub document uri 集合；只有用户手动重新添加时才会被清除。 */
+    fun removedUris(): Set<String> {
+        val raw = prefs.getString(KEY_REMOVED_URIS, null) ?: return emptySet()
+        return try {
+            val array = JSONArray(raw)
+            val result = LinkedHashSet<String>(array.length())
+            for (i in 0 until array.length()) result.add(array.getString(i))
+            result
+        } catch (_: Exception) {
+            emptySet()
+        }
+    }
+
+    private fun markRemoved(uris: Collection<String>) {
+        if (uris.isEmpty()) return
+        val merged = LinkedHashSet(removedUris())
+        merged.addAll(uris)
+        prefs.edit().putString(KEY_REMOVED_URIS, JSONArray(merged).toString()).apply()
+    }
+
+    private fun clearRemoved(uris: Collection<String>) {
+        if (uris.isEmpty()) return
+        val current = removedUris()
+        if (current.isEmpty()) return
+        val remaining = current - uris.toSet()
+        if (remaining.size == current.size) return
+        prefs.edit().putString(KEY_REMOVED_URIS, JSONArray(remaining.toList()).toString()).apply()
     }
 
     fun updateProgress(id: String, volumeIndex: Int, pageIndex: Int) {
@@ -119,6 +164,7 @@ class LibraryStore(context: Context) {
 
     companion object {
         private const val KEY_BOOKS = "books_v1"
+        private const val KEY_REMOVED_URIS = "removed_uris_v1"
 
         private val bookOrder =
             compareByDescending<LibraryBook> { it.lastReadAt }.thenByDescending { it.addedAt }
