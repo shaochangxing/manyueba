@@ -2,7 +2,7 @@
 
 一个极简的 Android 漫画阅读器，支持图片型 EPUB 漫画，按文件夹分卷连续阅读。
 
-![书柜](docs/screenshots/01-app.jpg)
+<img src="docs/screenshots/01-app.jpg" width="300">
 
 > 截图为真机书柜界面。当前只添加了两本书，因此第一行第三个位置为空。
 
