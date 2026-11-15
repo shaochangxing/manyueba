@@ -81,7 +81,7 @@ class LibraryStore(context: Context) {
     }
 
     /**
-     * 仅从书库移除该条目，不删除磁盘上的 EPUB 原文件；以后若要物理删除文件，集中在这里扩展。
+     * 仅从书库移除该条目，不删除磁盘上的漫画原文件；以后若要物理删除文件，集中在这里扩展。
      * 同时记录被移除的 document uri，重扫文件夹时跳过它们，避免被当成新增卷自动补回。
      */
     fun remove(id: String): Boolean {
@@ -94,7 +94,7 @@ class LibraryStore(context: Context) {
         return true
     }
 
-    /** 已被用户删除的 epub document uri 集合；只有用户手动重新添加时才会被清除。 */
+    /** 已被用户删除的文件 document uri 集合；只有用户手动重新添加时才会被清除。 */
     fun removedUris(): Set<String> {
         val raw = prefs.getString(KEY_REMOVED_URIS, null) ?: return emptySet()
         return try {

@@ -1,20 +1,12 @@
 package com.sqz.mangyueba
 
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.net.Uri
-import android.util.LruCache
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.File
 import java.io.IOException
 import java.net.URLDecoder
-import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 
 data class EpubPage(val entry: String)
@@ -23,13 +15,6 @@ data class EpubMeta(
     val title: String,
     val coverEntry: String?,
     val pages: List<EpubPage>
-)
-
-data class ReaderPage(
-    val entry: String,
-    val width: Int,
-    val height: Int,
-    val sampleSize: Int
 )
 
 /** 解析 EPUB 的 container.xml → OPF → spine，并按 spine 顺序提取图片页和封面。 */
@@ -220,129 +205,95 @@ object EpubParser {
         value.lowercase().replace(Regex("(\\d+)"), "00000000$1")
 }
 
-/** EPUB 文件的本地副本、解析结果与封面解码。 */
-class EpubRepository(context: Context) {
+/** 单卷 EPUB：持有一个 ZipFile，按 spine 提取出的图片顺序分页解码。 */
+class EpubVolume(
+    file: File,
+    private val targetWidth: Int,
+    private val meta: EpubMeta
+) : ComicVolume {
 
-    private val appContext = context.applicationContext
-    private val cacheDir = File(appContext.cacheDir, "epub").apply { mkdirs() }
-    private val parsedCache = object : LruCache<String, EpubMeta>(8) {}
-    private val copyLocks = ConcurrentHashMap<String, Any>()
-    private val prefetching = ConcurrentHashMap<String, Boolean>()
+    private val lock = Any()
+    private val zip = ZipFile(file)
+    private var pages: List<ReaderPage>? = null
+    private var entries: List<String> = emptyList()
+    private var samples: List<Int> = emptyList()
+    private var closed = false
 
-    fun parse(uri: Uri): EpubMeta {
-        val key = uri.toString()
-        parsedCache.get(key)?.let { return it }
-        val meta = EpubParser.parse(localFile(uri))
-        parsedCache.put(key, meta)
-        return meta
-    }
-
-    fun localFile(uri: Uri): File {
-        val key = uri.toString()
-        val dir = cacheDir
-        val name = hash(key) + ".epub"
-        val target = File(dir, name)
-        if (target.exists() && target.length() > 0) return target
-        val lock = copyLocks.getOrPut(name) { Any() }
+    override fun openPages(): List<ReaderPage> {
         synchronized(lock) {
-            if (target.exists() && target.length() > 0) return target
-            val tmp = File(dir, "$name.tmp")
-            appContext.contentResolver.openInputStream(uri)?.use { input ->
-                tmp.outputStream().use { output -> input.copyTo(output) }
-            } ?: throw IOException("无法读取所选文件")
-            if (target.exists()) target.delete()
-            if (!tmp.renameTo(target)) {
-                tmp.copyTo(target, overwrite = true)
-                tmp.delete()
-            }
+            pages?.let { return it }
         }
-        return target
+        val result = ArrayList<ReaderPage>(meta.pages.size)
+        val pageEntries = ArrayList<String>(meta.pages.size)
+        val pageSamples = ArrayList<Int>(meta.pages.size)
+        for (page in meta.pages) {
+            val entry = zip.getEntry(page.entry) ?: continue
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            try {
+                zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, bounds) }
+            } catch (_: Exception) {
+                continue
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) continue
+            result.add(ReaderPage(bounds.outWidth, bounds.outHeight))
+            pageEntries.add(page.entry)
+            pageSamples.add(ComicRepository.sampleSizeFor(bounds.outWidth, targetWidth))
+        }
+        synchronized(lock) {
+            entries = pageEntries
+            samples = pageSamples
+            pages = result
+        }
+        return result
     }
 
-    fun loadCover(uri: Uri, targetWidth: Int): Bitmap? {
-        val meta = parse(uri)
-        val entryName = meta.coverEntry ?: meta.pages.firstOrNull()?.entry ?: return null
-        val file = localFile(uri)
+    override fun decode(index: Int): Bitmap? {
+        openPages()
+        val entryName: String
+        val sample: Int
+        synchronized(lock) {
+            if (closed) return null
+            entryName = entries.getOrNull(index) ?: return null
+            sample = samples.getOrNull(index) ?: 1
+        }
         return try {
-            ZipFile(file).use { zip ->
-                val entry = zip.getEntry(entryName) ?: return null
-                decodeSampled(zip, entry, targetWidth)
+            val entry = zip.getEntry(entryName) ?: return null
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.RGB_565
             }
+            zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
         } catch (_: Exception) {
             null
         }
     }
 
-    /** 提前解析并解码相邻卷的第一页，结果写入全局位图缓存。 */
-    fun prefetchFirstPage(uri: Uri, targetWidth: Int, scope: CoroutineScope) {
-        val key = cacheKey(uri, 0)
-        if (ComicBitmapCache.get(key) != null) return
-        if (prefetching.putIfAbsent(key, true) != null) return
-        scope.launch(Dispatchers.IO) {
-            try {
-                val meta = parse(uri)
-                val entryName = meta.pages.firstOrNull()?.entry ?: meta.coverEntry ?: return@launch
-                ZipFile(localFile(uri)).use { zip ->
-                    val entry = zip.getEntry(entryName) ?: return@launch
-                    decodeSampled(zip, entry, targetWidth)?.let { ComicBitmapCache.put(key, it) }
-                }
-            } catch (_: Exception) {
-                // 相邻卷暂时不可读时忽略，不影响当前阅读
-            } finally {
-                prefetching.remove(key)
-            }
-        }
-    }
-
-    companion object {
-        fun cacheKey(uri: Uri, page: Int): String = "$uri#$page"
-
-        fun sampleSizeFor(width: Int, targetWidth: Int): Int {
-            var sample = 1
-            while (width / (sample * 2) >= targetWidth) sample *= 2
-            return sample
-        }
-
-        fun decodeSampled(zip: ZipFile, entry: java.util.zip.ZipEntry, targetWidth: Int): Bitmap? {
+    override fun decodeCover(): Bitmap? {
+        val entryName = meta.coverEntry ?: meta.pages.firstOrNull()?.entry ?: return null
+        return try {
+            val entry = zip.getEntry(entryName) ?: return null
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, bounds) }
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
             val options = BitmapFactory.Options().apply {
-                inSampleSize = sampleSizeFor(bounds.outWidth, targetWidth)
+                inSampleSize = ComicRepository.sampleSizeFor(bounds.outWidth, targetWidth)
                 inPreferredConfig = Bitmap.Config.RGB_565
             }
-            return zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
-        }
-
-        private fun hash(value: String): String {
-            val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
-            return digest.joinToString("") { "%02x".format(it) }.take(24)
+            zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
+        } catch (_: Exception) {
+            null
         }
     }
-}
 
-object ComicBitmapCache {
-    private val maxSize = (Runtime.getRuntime().maxMemory() / 1024 / 4).toInt()
-    private val cache = object : LruCache<String, Bitmap>(maxSize) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
-    }
-
-    fun get(key: String): Bitmap? = cache.get(key)
-
-    fun put(key: String, bitmap: Bitmap) {
-        cache.put(key, bitmap)
-    }
-}
-
-object CoverBitmapCache {
-    private val maxSize = (Runtime.getRuntime().maxMemory() / 1024 / 12).toInt()
-    private val cache = object : LruCache<String, Bitmap>(maxSize) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
-    }
-
-    fun get(key: String): Bitmap? = cache.get(key)
-
-    fun put(key: String, bitmap: Bitmap) {
-        cache.put(key, bitmap)
+    override fun close() {
+        synchronized(lock) {
+            if (closed) return
+            closed = true
+            try {
+                zip.close()
+            } catch (_: Exception) {
+                // 已经失效的 ZipFile 无需再处理
+            }
+        }
     }
 }

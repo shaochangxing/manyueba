@@ -78,7 +78,7 @@ private const val DeleteLongPressMillis = 1000L
 fun ShelfScreen(
     books: List<LibraryBook>,
     store: LibraryStore,
-    repository: EpubRepository,
+    repository: ComicRepository,
     targetWidth: Int,
     onOpenBook: (LibraryBook) -> Unit,
     onLibraryChanged: (List<LibraryBook>) -> Unit
@@ -110,11 +110,13 @@ fun ShelfScreen(
             adding = true
             try {
                 SafUtils.persistReadPermission(context, treeUri)
-                val files = withContext(Dispatchers.IO) { SafUtils.listEpubFiles(context, treeUri) }
+                val files = withContext(Dispatchers.IO) { SafUtils.listComicFiles(context, treeUri) }
                 if (files.isEmpty()) {
-                    showToast("该文件夹中没有 EPUB 文件")
+                    showToast("该文件夹中没有支持的漫画文件")
                 } else {
-                    withContext(Dispatchers.IO) { repository.parse(files.first()) }
+                    withContext(Dispatchers.IO) {
+                        repository.openVolume(files.first(), targetWidth).close()
+                    }
                     val folderName = SafUtils.treeDisplayName(context, treeUri) ?: "漫画文件夹"
                     val added = store.add(
                         LibraryBook(
@@ -296,7 +298,7 @@ fun ShelfScreen(
 @Composable
 private fun BookCell(
     book: LibraryBook,
-    repository: EpubRepository,
+    repository: ComicRepository,
     targetWidth: Int,
     deleteMode: Boolean,
     isDragging: Boolean,
@@ -419,7 +421,7 @@ private fun BookCell(
 }
 
 @Composable
-private fun BookCover(book: LibraryBook, repository: EpubRepository, targetWidth: Int) {
+private fun BookCover(book: LibraryBook, repository: ComicRepository, targetWidth: Int) {
     val coverUri = book.coverUri
     var bitmap by remember(coverUri) {
         mutableStateOf(coverUri?.let { CoverBitmapCache.get(it) })

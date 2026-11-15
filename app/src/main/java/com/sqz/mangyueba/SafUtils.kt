@@ -41,8 +41,12 @@ object SafUtils {
         }
     }
 
-    /** 枚举文件夹下一层的所有 .epub，按文件名中的数字自然排序。 */
-    fun listEpubFiles(context: Context, treeUri: Uri): List<Uri> {
+    /**
+     * 枚举文件夹下一层的所有受支持漫画文件，按文件名自然排序。
+     * 同名不同格式（如 xxx.mobi / xxx.pdf）只保留一个，优先 EPUB > PDF > MOBI，
+     * 这样同一部漫画不会被当成多卷重复加入。
+     */
+    fun listComicFiles(context: Context, treeUri: Uri): List<Uri> {
         val treeDocId = try {
             DocumentsContract.getTreeDocumentId(treeUri)
         } catch (_: Exception) {
@@ -54,7 +58,7 @@ object SafUtils {
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE
         )
-        val entries = ArrayList<Pair<String, String>>() // documentId to name
+        val entries = ArrayList<FoundFile>()
         try {
             context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
                 while (cursor.moveToNext()) {
@@ -62,18 +66,29 @@ object SafUtils {
                     val name = cursor.getString(1) ?: continue
                     val mime = cursor.getString(2)
                     if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
-                    if (!name.lowercase().endsWith(".epub")) continue
-                    entries.add(docId to name)
+                    val format = ComicFormat.fromFileName(name) ?: continue
+                    entries.add(FoundFile(docId, name, format))
                 }
             }
         } catch (_: Exception) {
             return emptyList()
         }
-        entries.sortWith { a, b -> naturalCompare(a.second, b.second) }
-        return entries.map { (docId, _) ->
-            DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        if (entries.isEmpty()) return emptyList()
+
+        val grouped = LinkedHashMap<String, MutableList<FoundFile>>()
+        for (entry in entries) {
+            grouped.getOrPut(ComicNaming.baseName(entry.name)) { ArrayList() }.add(entry)
         }
+        val selected = grouped.values.mapNotNull { group ->
+            group.minWithOrNull(
+                compareBy<FoundFile> { it.format.ordinal }.thenBy { it.name.lowercase() }
+            )
+        }
+        val sorted = selected.sortedWith { a, b -> naturalCompare(a.name, b.name) }
+        return sorted.map { DocumentsContract.buildDocumentUriUsingTree(treeUri, it.docId) }
     }
+
+    private class FoundFile(val docId: String, val name: String, val format: ComicFormat)
 
     fun naturalCompare(a: String, b: String): Int {
         val sa = a.lowercase()

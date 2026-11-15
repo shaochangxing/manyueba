@@ -24,7 +24,7 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
 
     private lateinit var store: LibraryStore
-    private lateinit var repository: EpubRepository
+    private lateinit var repository: ComicRepository
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
         }
 
         store = LibraryStore(this)
-        repository = EpubRepository(this)
+        repository = ComicRepository(this)
         val screenWidth = resources.displayMetrics.widthPixels
 
         setContent {
@@ -81,18 +81,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 读出文件夹当前所有 epub 的 document uri，按自然序返回；读取失败或为空时返回 null，避免清空已有卷。 */
+    /** 读出文件夹当前所有受支持漫画文件的 document uri，按自然序返回；读取失败或为空时返回 null，避免清空已有卷。 */
     private fun scanVolumes(book: LibraryBook): List<String>? {
         if (!book.id.startsWith("folder:")) return null
         val treeUri = Uri.parse(book.id.removePrefix("folder:"))
-        val files = SafUtils.listEpubFiles(this, treeUri).map { it.toString() }
+        val files = SafUtils.listComicFiles(this, treeUri).map { it.toString() }
         return files.ifEmpty { null }
     }
 
     /** 目录内容未变化时返回 null；有变化则写回书库并返回刷新后的书库。 */
     private suspend fun refreshVolumes(book: LibraryBook): List<LibraryBook>? {
         val scanned = withContext(Dispatchers.IO) { scanVolumes(book) } ?: return null
-        // 跳过用户已删除的 epub，避免重扫时把它们当成新增卷补回
+        // 跳过用户已删除的文件，避免重扫时把它们当成新增卷补回
         val removed = withContext(Dispatchers.IO) { store.removedUris() }
         val effective = if (removed.isEmpty()) scanned else scanned.filterNot { it in removed }
         // 过滤后为空或与现有卷一致时不写回，避免误清空书库与删除记录

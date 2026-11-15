@@ -1,7 +1,6 @@
 package com.sqz.mangyueba
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import android.widget.Toast
@@ -52,7 +51,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.withContext
-import java.util.zip.ZipFile
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -62,7 +60,7 @@ private const val ZoomLockThreshold = 1.05f
 @Composable
 fun ReaderScreen(
     book: LibraryBook,
-    repository: EpubRepository,
+    repository: ComicRepository,
     targetWidth: Int,
     onProgress: (volume: Int, page: Int) -> Unit,
     onBack: () -> Unit
@@ -96,7 +94,7 @@ fun ReaderScreen(
 
     LaunchedEffect(failed) {
         if (failed) {
-            Toast.makeText(context, "无法打开该 EPUB", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "无法打开该漫画", Toast.LENGTH_SHORT).show()
             onBack()
         }
     }
@@ -137,7 +135,7 @@ fun ReaderScreen(
 @Composable
 private fun ReaderPager(
     book: LibraryBook,
-    repository: EpubRepository,
+    repository: ComicRepository,
     scope: CoroutineScope,
     session: VolumeSession,
     volumeUri: Uri,
@@ -355,60 +353,39 @@ private fun PageItem(session: VolumeSession, page: ReaderPage, index: Int) {
     }
 }
 
-/** 单卷阅读会话：持有 ZipFile、页尺寸、位图解码与并发去重。 */
+/** 单卷阅读会话：持有 ComicVolume、页尺寸、位图解码与并发去重。 */
 class VolumeSession(
-    private val repository: EpubRepository,
+    private val repository: ComicRepository,
     val uri: Uri,
     private val targetWidth: Int,
     private val scope: CoroutineScope
 ) {
     private val lock = Any()
-    private var zip: ZipFile? = null
-    private var pages: List<ReaderPage> = emptyList()
+    private var volume: ComicVolume? = null
     private val jobs = HashMap<Int, Deferred<Bitmap?>>()
     private var closed = false
 
     suspend fun open(): List<ReaderPage> = withContext(Dispatchers.IO) {
-        val meta = repository.parse(uri)
-        val zipFile = ZipFile(repository.localFile(uri))
-        try {
-            val result = ArrayList<ReaderPage>(meta.pages.size)
-            for (page in meta.pages) {
-                val entry = zipFile.getEntry(page.entry) ?: continue
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                try {
-                    zipFile.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, bounds) }
-                } catch (_: Exception) {
-                    continue
-                }
-                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) continue
-                result.add(
-                    ReaderPage(
-                        entry = page.entry,
-                        width = bounds.outWidth,
-                        height = bounds.outHeight,
-                        sampleSize = EpubRepository.sampleSizeFor(bounds.outWidth, targetWidth)
-                    )
-                )
-            }
-            synchronized(lock) {
-                if (closed) {
-                    zipFile.close()
-                    emptyList()
-                } else {
-                    zip = zipFile
-                    pages = result
-                    Log.i("MangYueBa", "opened $uri pages=${result.size}")
-                    result
-                }
-            }
+        val opened = repository.openVolume(uri, targetWidth)
+        val result = try {
+            opened.openPages()
         } catch (e: Exception) {
-            zipFile.close()
+            opened.close()
             throw e
+        }
+        synchronized(lock) {
+            if (closed) {
+                opened.close()
+                emptyList()
+            } else {
+                volume = opened
+                Log.i("MangYueBa", "opened $uri pages=${result.size}")
+                result
+            }
         }
     }
 
-    fun cacheKey(index: Int): String = EpubRepository.cacheKey(uri, index)
+    fun cacheKey(index: Int): String = ComicRepository.cacheKey(uri, index)
 
     suspend fun decodeAsync(index: Int): Bitmap? {
         val key = cacheKey(index)
@@ -426,33 +403,29 @@ class VolumeSession(
     }
 
     private fun decode(index: Int): Bitmap? {
-        // 只在锁内取出 zip 与页信息，避免解码期间持锁阻塞主线程（主线程调用 decodeAsync 时会等这把锁）
-        val (zipFile, page) = synchronized(lock) {
-            val z = zip ?: return null
-            val p = pages.getOrNull(index) ?: return null
-            z to p
+        // 只在锁内取出当前卷，具体解码由各格式实现自行处理并发
+        val current = synchronized(lock) {
+            if (closed) return null
+            volume ?: return null
         }
-        return try {
-            val entry = zipFile.getEntry(page.entry) ?: return null
-            val options = BitmapFactory.Options().apply {
-                inSampleSize = page.sampleSize
-                inPreferredConfig = Bitmap.Config.RGB_565
-            }
-            zipFile.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, options) }
-        } catch (_: Exception) {
-            null
-        }
+        return current.decode(index)
     }
 
     fun close() {
         val pending: List<Deferred<Bitmap?>>
+        val current: ComicVolume?
         synchronized(lock) {
             closed = true
-            zip?.close()
-            zip = null
+            current = volume
+            volume = null
             pending = jobs.values.toList()
             jobs.clear()
         }
         pending.forEach { it.cancel() }
+        try {
+            current?.close()
+        } catch (_: Exception) {
+            // 关闭失败不影响返回书柜
+        }
     }
 }
