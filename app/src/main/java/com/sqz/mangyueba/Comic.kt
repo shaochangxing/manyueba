@@ -2,10 +2,12 @@ package com.sqz.mangyueba
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.LruCache
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
@@ -64,10 +66,13 @@ class ComicRepository(context: Context) {
 
     private val appContext = context.applicationContext
     private val cacheDir = File(appContext.cacheDir, "comic").apply { mkdirs() }
+    private val coverDir = File(appContext.cacheDir, "covers").apply { mkdirs() }
     private val epubMetaCache = object : LruCache<String, EpubMeta>(8) {}
     private val nameCache = ConcurrentHashMap<String, String>()
     private val copyLocks = ConcurrentHashMap<String, Any>()
     private val prefetching = ConcurrentHashMap<String, Boolean>()
+    private val coverPreloading = ConcurrentHashMap<String, Boolean>()
+    private val preloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** SAF 文件显示名；查询结果按 uri 缓存，找不到时退化为 uri 末段。 */
     fun displayName(uri: Uri): String {
@@ -122,22 +127,76 @@ class ComicRepository(context: Context) {
         return meta
     }
 
+    /** 书柜封面：先查磁盘缓存，未命中再解码并写盘，返回书柜时无需重复解析原文件。 */
     fun loadCover(uri: Uri, targetWidth: Int): Bitmap? {
-        val volume = try {
-            openVolume(uri, targetWidth)
-        } catch (_: Exception) {
-            return null
-        }
-        return try {
-            volume.decodeCover()
+        val key = uri.toString()
+        diskCover(key, targetWidth)?.let { return it }
+        val bitmap = try {
+            openVolume(uri, targetWidth).use { it.decodeCover() }
         } catch (_: Exception) {
             null
-        } finally {
-            try {
-                volume.close()
-            } catch (_: Exception) {
-                // 关闭失败不影响封面显示
+        } ?: return null
+        writeCover(key, bitmap)
+        return bitmap
+    }
+
+    /**
+     * 后台预热书柜封面到内存缓存；冷启动直接进阅读页时提前调用，
+     * 返回书柜时所有封面首帧即可显示，不再出现占位块闪烁。
+     */
+    fun preloadCovers(uris: List<String>, targetWidth: Int) {
+        for (uriString in uris) {
+            if (CoverBitmapCache.get(uriString) != null) continue
+            if (coverPreloading.putIfAbsent(uriString, true) != null) continue
+            preloadScope.launch {
+                try {
+                    loadCover(Uri.parse(uriString), targetWidth)
+                        ?.let { CoverBitmapCache.put(uriString, it) }
+                } catch (_: Exception) {
+                    // 单个封面预热失败不影响其它封面
+                } finally {
+                    coverPreloading.remove(uriString)
+                }
             }
+        }
+    }
+
+    private fun coverFile(key: String): File = File(coverDir, hash(key) + ".jpg")
+
+    /** 从磁盘封面按目标宽度采样解码；文件损坏时删除并返回 null，走完整解码路径。 */
+    private fun diskCover(key: String, targetWidth: Int): Bitmap? {
+        val file = coverFile(key)
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                file.delete()
+                return null
+            }
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sampleSizeFor(bounds.outWidth, targetWidth)
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            BitmapFactory.decodeFile(file.absolutePath, options)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 封面写盘；失败只影响下次的磁盘命中，不影响本次显示。 */
+    private fun writeCover(key: String, bitmap: Bitmap) {
+        try {
+            val tmp = File(coverDir, hash(key) + ".tmp")
+            tmp.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            val target = coverFile(key)
+            if (target.exists()) target.delete()
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        } catch (_: Exception) {
+            // 写盘失败不影响封面显示
         }
     }
 

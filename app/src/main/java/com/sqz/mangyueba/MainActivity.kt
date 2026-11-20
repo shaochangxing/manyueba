@@ -45,6 +45,14 @@ class MainActivity : ComponentActivity() {
                 var activeBookId by rememberSaveable { mutableStateOf(store.lastReadBook()?.id) }
                 val activeBook = books.firstOrNull { it.id == activeBookId }
 
+                // 后台预热书柜封面：冷启动直接进阅读页时也提前解码，返回书柜时首帧即可显示
+                LaunchedEffect(books) {
+                    repository.preloadCovers(
+                        books.mapNotNull { it.coverUri },
+                        (screenWidth / 3).coerceAtLeast(180)
+                    )
+                }
+
                 // 进入/打开漫画时重扫文件夹：只列目录条目，已有卷继续复用解析缓存
                 LaunchedEffect(activeBookId) {
                     val book = activeBook ?: return@LaunchedEffect
