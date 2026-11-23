@@ -7,18 +7,25 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -42,7 +49,10 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -80,6 +90,12 @@ fun ReaderScreen(
     var pages by remember(session) { mutableStateOf<List<ReaderPage>?>(null) }
     var failed by remember(session) { mutableStateOf(false) }
 
+    // 章节目录状态：开关、各卷名称、各卷总页数、各卷已读页（0 基）
+    var tocOpen by rememberSaveable(book.id) { mutableStateOf(false) }
+    var labels by remember(book.id) { mutableStateOf<Map<Int, String>>(emptyMap()) }
+    var pageCounts by remember(book.id) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
+    var pageMemory by remember(book.id) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
+
     LaunchedEffect(session) {
         try {
             pages = session.open()
@@ -99,36 +115,92 @@ fun ReaderScreen(
         }
     }
 
+    // 后台准备目录：条目名称 + 每卷总页数（解析失败或 DRM 受限的卷显示 "?"）
+    LaunchedEffect(book.id) {
+        labels = withContext(Dispatchers.IO) {
+            book.uris.mapIndexed { index, uriString ->
+                index to ComicNaming.volumeLabel(repository.displayName(Uri.parse(uriString)))
+            }
+        }.toMap()
+        book.uris.forEachIndexed { index, uriString ->
+            if (pageCounts[index] == null) {
+                repository.pageCount(Uri.parse(uriString), targetWidth)?.let { count ->
+                    pageCounts = pageCounts + (index to count)
+                }
+            }
+        }
+    }
+
+    // 持久化进度（恢复滚动位置用）；目录“已读”单独按看到的最深一页记录
+    val recordProgress: (Int, Int) -> Unit = { volume, page ->
+        onProgress(volume, page)
+    }
+
     BackHandler { onBack() }
 
     val loaded = pages
-    if (loaded == null) {
-        Box(Modifier.fillMaxSize().background(Color.Black))
-    } else {
-        key(volumeUri) {
-            ReaderPager(
-                book = book,
-                repository = repository,
-                scope = scope,
-                session = session,
-                volumeUri = volumeUri,
-                volumeIndex = volumeIndex,
-                pages = loaded,
-                startPage = startPage,
-                targetWidth = targetWidth,
-                onProgress = onProgress,
-                onBack = onBack,
-                onNextVolume = {
-                    val next = volumeIndex + 1
-                    if (next <= book.uris.lastIndex) {
-                        Log.i("MangYueBa", "switch volume ${volumeIndex} -> $next")
-                        startPage = 0
-                        volumeIndex = next
-                        onProgress(next, 0)
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (loaded == null) {
+            Box(Modifier.fillMaxSize().background(Color.Black))
+        } else {
+            key(volumeUri) {
+                ReaderPager(
+                    book = book,
+                    repository = repository,
+                    scope = scope,
+                    session = session,
+                    volumeUri = volumeUri,
+                    volumeIndex = volumeIndex,
+                    pages = loaded,
+                    startPage = startPage,
+                    targetWidth = targetWidth,
+                    onProgress = recordProgress,
+                    onTocPage = { volume, page ->
+                        pageMemory = pageMemory + (volume to page)
+                    },
+                    onBack = onBack,
+                    onToggleToc = { tocOpen = !tocOpen },
+                    onNextVolume = {
+                        val next = volumeIndex + 1
+                        if (next <= book.uris.lastIndex) {
+                            Log.i("MangYueBa", "switch volume ${volumeIndex} -> $next")
+                            startPage = 0
+                            volumeIndex = next
+                            pageMemory = pageMemory + (next to 0)
+                            onProgress(next, 0)
+                        }
                     }
-                }
+                )
+            }
+        }
+        if (tocOpen) {
+            TocOverlay(
+                entries = book.uris.indices.map { index ->
+                    TocEntry(index, labels[index] ?: "第${index + 1}卷")
+                },
+                pageCounts = pageCounts,
+                pageMemory = pageMemory,
+                currentIndex = volumeIndex,
+                fallbackPage = book.pageIndex,
+                onSelect = { index ->
+                    tocOpen = false
+                    if (index != volumeIndex) {
+                        val target = (pageMemory[index] ?: 0)
+                            .coerceIn(0, ((pageCounts[index] ?: 1) - 1).coerceAtLeast(0))
+                        startPage = target
+                        volumeIndex = index
+                        pageMemory = pageMemory + (index to target)
+                        onProgress(index, target)
+                    }
+                },
+                onDismiss = { tocOpen = false }
             )
         }
+    }
+
+    // 目录打开时返回键先收起目录（后注册的 BackHandler 优先）
+    if (tocOpen) {
+        BackHandler { tocOpen = false }
     }
 }
 
@@ -144,7 +216,9 @@ private fun ReaderPager(
     startPage: Int,
     targetWidth: Int,
     onProgress: (volume: Int, page: Int) -> Unit,
+    onTocPage: (volume: Int, page: Int) -> Unit,
     onBack: () -> Unit,
+    onToggleToc: () -> Unit,
     onNextVolume: () -> Unit
 ) {
     val listState = remember(volumeUri) {
@@ -157,6 +231,7 @@ private fun ReaderPager(
     val zoomed = scale > ZoomLockThreshold
 
     val currentProgress by rememberUpdatedState(onProgress)
+    val currentTocPage by rememberUpdatedState(onTocPage)
     val currentBack by rememberUpdatedState(onBack)
 
     fun leaveReader() {
@@ -167,11 +242,16 @@ private fun ReaderPager(
     BackHandler { leaveReader() }
 
     LaunchedEffect(listState) {
-        snapshotFlow { listState.firstVisibleItemIndex }
+        snapshotFlow {
+            val info = listState.layoutInfo
+            listState.firstVisibleItemIndex to (info.visibleItemsInfo.lastOrNull()?.index ?: 0)
+        }
             .distinctUntilChanged()
-            .collect { index ->
+            .collect { (first, lastVisible) ->
                 // 写 SharedPreferences 会解析/序列化整库 JSON，不能放在滚动期间的主线程上
-                withContext(Dispatchers.IO) { currentProgress(volumeIndex, index) }
+                withContext(Dispatchers.IO) { currentProgress(volumeIndex, first) }
+                // 目录“已读”按看到的最深一页记录，读到卷尾时正好等于总页数
+                currentTocPage(volumeIndex, maxOf(first, lastVisible))
             }
     }
 
@@ -236,9 +316,14 @@ private fun ReaderPager(
             .background(Color.Black)
             .pointerInput(volumeUri) {
                 detectTapGestures(
-                    onTap = {
-                        scale = 1f
-                        offset = Offset.Zero
+                    onTap = { position ->
+                        // 轻点左侧 1/4 唤出/收起章节目录；其余区域轻点还原缩放
+                        if (position.x < size.width / 4f) {
+                            onToggleToc()
+                        } else {
+                            scale = 1f
+                            offset = Offset.Zero
+                        }
                     }
                 )
             }
@@ -426,6 +511,84 @@ class VolumeSession(
             current?.close()
         } catch (_: Exception) {
             // 关闭失败不影响返回书柜
+        }
+    }
+}
+
+private data class TocEntry(val index: Int, val label: String)
+
+/** 左侧章节目录浮层：条目为卷名 + “已读/总页”；点遮罩收起，点条目跳卷。 */
+@Composable
+private fun TocOverlay(
+    entries: List<TocEntry>,
+    pageCounts: Map<Int, Int>,
+    pageMemory: Map<Int, Int>,
+    currentIndex: Int,
+    fallbackPage: Int,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val listState = remember {
+        LazyListState(
+            firstVisibleItemIndex = currentIndex.coerceIn(0, (entries.lastIndex).coerceAtLeast(0))
+        )
+    }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.45f))
+            .pointerInput(Unit) {
+                // 只在未被子层（列表条目/滚动）消费时视为轻点收起；列表内滑动由列表自己处理
+                detectTapGestures { onDismiss() }
+            }
+    ) {
+        Column(
+            Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(0.72f)
+                .background(Color(0xFF17171A))
+        ) {
+            Text(
+                text = "目录",
+                color = Color(0xFF9A9AA2),
+                fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+            )
+            Box(Modifier.fillMaxWidth().height(0.5.dp).background(Color(0xFF2A2A30)))
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                itemsIndexed(entries, key = { _, entry -> entry.index }) { _, entry ->
+                    val isCurrent = entry.index == currentIndex
+                    val total = pageCounts[entry.index]
+                    val read = when {
+                        total == null -> null
+                        entry.index < currentIndex -> total
+                        entry.index == currentIndex ->
+                            ((pageMemory[entry.index] ?: fallbackPage) + 1).coerceIn(1, total)
+                        else -> pageMemory[entry.index]?.plus(1) ?: 0
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(entry.index) }
+                            .padding(horizontal = 16.dp, vertical = 13.dp)
+                    ) {
+                        Text(
+                            text = entry.label,
+                            color = if (isCurrent) Color(0xFFFA6658) else Color(0xFFDDDDE2),
+                            fontSize = 15.sp,
+                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = if (read == null) "?" else "$read/$total",
+                            color = Color(0xFF7C7C84),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
         }
     }
 }

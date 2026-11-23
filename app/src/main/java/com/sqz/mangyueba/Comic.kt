@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -41,6 +42,43 @@ object ComicNaming {
         val raw = if (dot > 0) fileName.substring(0, dot) else fileName
         return raw.trim().lowercase()
     }
+
+    // 目录条目名称的提取规则，按优先级依次尝试
+    private val DiNumbered = Regex("第\\s*([0-9一二三四五六七八九十]{1,7})\\s*(卷|話|话|章|冊|册)")
+    private val NumberBeforeUnit = Regex("(\\d{1,4}(?:-\\d{1,4})?)\\s*(卷|話|话|章|冊|册)")
+    private val NumberAfterUnit = Regex("(卷|話|话|章|冊|册)\\s*第?\\s*(\\d{1,4}(?:-\\d{1,4})?)")
+    private val AnyNumber = Regex("\\d{1,4}(?:-\\d{1,4})?")
+    private val Spaces = Regex("\\s+")
+    private val TrailingSeparators = Regex("[\\s\\-－_—・~～]+")
+
+    /**
+     * 目录条目名称：从文件名提取“01卷 / 卷01 / 話001-010 / 第3章 / 01”这类编号；
+     * 提取不到时退化为清理掉括号来源信息后的文件名前 12 字。
+     */
+    fun volumeLabel(fileName: String): String {
+        val dot = fileName.lastIndexOf('.')
+        val base = if (dot > 0) fileName.substring(0, dot) else fileName
+        // 去掉括号组（含全角）与方括号组，避免作者名、z-library 来源信息等干扰
+        val cleaned = base
+            .replace(Regex("\\([^)]*\\)"), " ")
+            .replace(Regex("（[^）]*）"), " ")
+            .replace(Regex("\\[[^\\]]*\\]"), " ")
+        // 全角数字转半角，便于匹配
+        val net = cleaned.map { ch ->
+            if (ch in '０'..'９') ('0' + (ch - '０')) else ch
+        }.joinToString("").trim()
+
+        DiNumbered.find(net)?.let { return it.value.replace(Spaces, "") }
+        NumberBeforeUnit.find(net)?.let { return it.value.replace(Spaces, "") }
+        NumberAfterUnit.find(net)?.let { return it.value.replace(Spaces, "") }
+        AnyNumber.findAll(net).lastOrNull()?.let { return it.value }
+        val fallback = TrailingSeparators.replace(net, " ").trim()
+        return if (fallback.isEmpty()) {
+            base.trim().take(12).ifEmpty { fileName.trim().ifEmpty { "未命名" } }
+        } else {
+            fallback.take(12)
+        }
+    }
 }
 
 /** 单卷漫画的读取入口，EPUB / PDF / MOBI 各自实现。 */
@@ -72,6 +110,7 @@ class ComicRepository(context: Context) {
     private val copyLocks = ConcurrentHashMap<String, Any>()
     private val prefetching = ConcurrentHashMap<String, Boolean>()
     private val coverPreloading = ConcurrentHashMap<String, Boolean>()
+    private val pageCountCache = ConcurrentHashMap<String, Int>()
     private val preloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** SAF 文件显示名；查询结果按 uri 缓存，找不到时退化为 uri 末段。 */
@@ -159,6 +198,24 @@ class ComicRepository(context: Context) {
                 }
             }
         }
+    }
+
+    /**
+     * 目录用：统计一个卷的总页数；文件不可读或 DRM 受限时返回 null。
+     * 结果按进程缓存，同一会话内再次打开目录不再重新解析。
+     */
+    suspend fun pageCount(uri: Uri, targetWidth: Int): Int? {
+        val key = uri.toString()
+        pageCountCache[key]?.let { return it }
+        val count = withContext(Dispatchers.IO) {
+            try {
+                openVolume(uri, targetWidth).use { it.openPages().size }
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (count != null) pageCountCache[key] = count
+        return count
     }
 
     private fun coverFile(key: String): File = File(coverDir, hash(key) + ".jpg")
