@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -111,6 +112,13 @@ class ComicRepository(context: Context) {
     private val prefetching = ConcurrentHashMap<String, Boolean>()
     private val coverPreloading = ConcurrentHashMap<String, Boolean>()
     private val pageCountCache = ConcurrentHashMap<String, Int>()
+
+    // 目录页数的磁盘缓存：uri -> 总页数，跨进程重启复用，避免每次打开都逐卷解析
+    private val tocFile = File(appContext.cacheDir, "toc_pages.json")
+    private val tocStore = JSONObject()
+    private val tocLock = Any()
+    @Volatile private var tocLoaded = false
+
     private val preloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /** SAF 文件显示名；查询结果按 uri 缓存，找不到时退化为 uri 末段。 */
@@ -202,11 +210,20 @@ class ComicRepository(context: Context) {
 
     /**
      * 目录用：统计一个卷的总页数；文件不可读或 DRM 受限时返回 null。
-     * 结果按进程缓存，同一会话内再次打开目录不再重新解析。
+     * 结果进程内缓存 + 磁盘缓存（toc_pages.json），同一会话即时返回，
+     * 重启 App 后首次打开目录也无需重新解析。
      */
     suspend fun pageCount(uri: Uri, targetWidth: Int): Int? {
         val key = uri.toString()
         pageCountCache[key]?.let { return it }
+        synchronized(tocLock) {
+            ensureTocLoaded()
+            val disk = tocStore.optInt(key, -1)
+            if (disk >= 0) {
+                pageCountCache[key] = disk
+                return disk
+            }
+        }
         val count = withContext(Dispatchers.IO) {
             try {
                 openVolume(uri, targetWidth).use { it.openPages().size }
@@ -214,8 +231,47 @@ class ComicRepository(context: Context) {
                 null
             }
         }
-        if (count != null) pageCountCache[key] = count
+        if (count != null) {
+            pageCountCache[key] = count
+            synchronized(tocLock) {
+                tocStore.put(key, count)
+                persistTocLocked()
+            }
+        }
         return count
+    }
+
+    /** 首次访问时读取磁盘缓存；损坏则直接重建。 */
+    private fun ensureTocLoaded() {
+        if (tocLoaded) return
+        try {
+            tocFile.takeIf { it.exists() }?.bufferedReader()?.use { reader ->
+                val obj = JSONObject(reader.readText())
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    tocStore.put(key, obj.optInt(key, -1))
+                }
+            }
+        } catch (_: Exception) {
+            // 缓存损坏时清空重建，不影响功能
+        }
+        tocLoaded = true
+    }
+
+    /** 写盘：临时文件 + 原子替换，崩溃不留半截文件。 */
+    private fun persistTocLocked() {
+        try {
+            val tmp = File(tocFile.parentFile, tocFile.name + ".tmp")
+            tmp.writeText(tocStore.toString())
+            if (tocFile.exists()) tocFile.delete()
+            if (!tmp.renameTo(tocFile)) {
+                tmp.copyTo(tocFile, overwrite = true)
+                tmp.delete()
+            }
+        } catch (_: Exception) {
+            // 写盘失败只影响下次启动的缓存命中
+        }
     }
 
     private fun coverFile(key: String): File = File(coverDir, hash(key) + ".jpg")
