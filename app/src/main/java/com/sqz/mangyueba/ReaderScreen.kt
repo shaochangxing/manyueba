@@ -82,13 +82,9 @@ fun ReaderScreen(
     }
     var startPage by rememberSaveable(book.id) { mutableStateOf(book.pageIndex) }
 
-    val volumeUriString = book.uris[volumeIndex.coerceIn(0, book.uris.lastIndex)]
-    val volumeUri = remember(volumeUriString) { Uri.parse(volumeUriString) }
-    val session = remember(volumeUri) {
-        VolumeSession(repository, volumeUri, targetWidth, scope)
-    }
-    var pages by remember(session) { mutableStateOf<List<ReaderPage>?>(null) }
-    var failed by remember(session) { mutableStateOf(false) }
+    var volume by remember(book.id) { mutableStateOf<PreparedVolume?>(null) }
+    var prepared by remember(book.id) { mutableStateOf<PreparedVolume?>(null) }
+    var failed by remember(book.id) { mutableStateOf(false) }
 
     // 章节目录状态：开关、各卷名称、各卷总页数、各卷已读页（0 基）
     var tocOpen by rememberSaveable(book.id) { mutableStateOf(false) }
@@ -96,16 +92,49 @@ fun ReaderScreen(
     var pageCounts by remember(book.id) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
     var pageMemory by remember(book.id) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
 
-    LaunchedEffect(session) {
+    // 异步打开当前卷：首次进入，或切到尚未预开的卷时
+    LaunchedEffect(volumeIndex, book.id) {
+        if (volume?.index == volumeIndex) return@LaunchedEffect
+        failed = false
+        val s = VolumeSession(
+            repository,
+            Uri.parse(book.uris[volumeIndex.coerceIn(0, book.uris.lastIndex)]),
+            targetWidth,
+            scope
+        )
         try {
-            pages = session.open()
+            val p = s.open()
+            volume = PreparedVolume(volumeIndex, s, p)
         } catch (_: Exception) {
+            s.close()
             failed = true
         }
     }
 
-    DisposableEffect(session) {
-        onDispose { session.close() }
+    // 当前卷打开后，后台预开下一卷：文件复制/解析/页尺寸提前完成，切卷零等待
+    LaunchedEffect(volumeIndex, volume != null, book.id) {
+        if (volume == null) return@LaunchedEffect
+        val next = volumeIndex + 1
+        if (next > book.uris.lastIndex || prepared?.index == next) return@LaunchedEffect
+        prepared?.session?.close()
+        prepared = null
+        val s = VolumeSession(repository, Uri.parse(book.uris[next]), targetWidth, scope)
+        try {
+            val p = s.open()
+            prepared = PreparedVolume(next, s, p)
+            // 顺手预解码下一卷首页，切过去后首帧即出图
+            s.decodeAsync(0)
+            Log.i("MangYueBa", "prepared next volume $next pages=${p.size}")
+        } catch (_: Exception) {
+            s.close()
+        }
+    }
+
+    DisposableEffect(book.id) {
+        onDispose {
+            volume?.session?.close()
+            prepared?.session?.close()
+        }
     }
 
     LaunchedEffect(failed) {
@@ -136,22 +165,44 @@ fun ReaderScreen(
         onProgress(volume, page)
     }
 
+    // 切卷：优先换用已预开的卷（同一帧生效、零等待），否则置空走异步打开
+    val switchTo: (Int, Int) -> Unit = { index, page ->
+        if (index != volumeIndex && index in book.uris.indices) {
+            val target = page.coerceIn(0, ((pageCounts[index] ?: 1) - 1).coerceAtLeast(0))
+            val ready = prepared?.takeIf { it.index == index }
+            val old = volume
+            if (ready != null) {
+                prepared = null
+                volume = ready
+                Log.i("MangYueBa", "switch volume ${volumeIndex} -> $index (prepared)")
+            } else {
+                volume = null
+                Log.i("MangYueBa", "switch volume ${volumeIndex} -> $index")
+            }
+            old?.session?.close()
+            startPage = target
+            volumeIndex = index
+            pageMemory = pageMemory + (index to target)
+            onProgress(index, target)
+        }
+    }
+
     BackHandler { onBack() }
 
-    val loaded = pages
+    val loaded = volume
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (loaded == null) {
             Box(Modifier.fillMaxSize().background(Color.Black))
         } else {
-            key(volumeUri) {
+            key(loaded.session) {
                 ReaderPager(
                     book = book,
                     repository = repository,
                     scope = scope,
-                    session = session,
-                    volumeUri = volumeUri,
-                    volumeIndex = volumeIndex,
-                    pages = loaded,
+                    session = loaded.session,
+                    volumeUri = loaded.session.uri,
+                    volumeIndex = loaded.index,
+                    pages = loaded.pages,
                     startPage = startPage,
                     targetWidth = targetWidth,
                     onProgress = recordProgress,
@@ -160,16 +211,7 @@ fun ReaderScreen(
                     },
                     onBack = onBack,
                     onToggleToc = { tocOpen = !tocOpen },
-                    onNextVolume = {
-                        val next = volumeIndex + 1
-                        if (next <= book.uris.lastIndex) {
-                            Log.i("MangYueBa", "switch volume ${volumeIndex} -> $next")
-                            startPage = 0
-                            volumeIndex = next
-                            pageMemory = pageMemory + (next to 0)
-                            onProgress(next, 0)
-                        }
-                    }
+                    onNextVolume = { switchTo(volumeIndex + 1, 0) }
                 )
             }
         }
@@ -184,14 +226,7 @@ fun ReaderScreen(
                 fallbackPage = book.pageIndex,
                 onSelect = { index ->
                     tocOpen = false
-                    if (index != volumeIndex) {
-                        val target = (pageMemory[index] ?: 0)
-                            .coerceIn(0, ((pageCounts[index] ?: 1) - 1).coerceAtLeast(0))
-                        startPage = target
-                        volumeIndex = index
-                        pageMemory = pageMemory + (index to target)
-                        onProgress(index, target)
-                    }
+                    switchTo(index, pageMemory[index] ?: 0)
                 },
                 onDismiss = { tocOpen = false }
             )
@@ -514,6 +549,13 @@ class VolumeSession(
         }
     }
 }
+
+/** 当前卷或预开的下一卷：会话 + 已打开的页列表（预开后切卷零等待）。 */
+private data class PreparedVolume(
+    val index: Int,
+    val session: VolumeSession,
+    val pages: List<ReaderPage>
+)
 
 private data class TocEntry(val index: Int, val label: String)
 
